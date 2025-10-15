@@ -2,51 +2,114 @@ import os
 import asyncio
 import requests
 from dotenv import set_key, find_dotenv
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-PROLIFIC_API_URL = os.getenv("PROLIFIC_API_URL", "https://internal-api.prolific.com/api/v1/participant/studies/")
+PROLIFIC_API_URL = os.getenv(
+    "PROLIFIC_API_URL",
+    "https://internal-api.prolific.com/api/v1/participant/studies/"
+)
 WHATSAPP_NUMBER = os.getenv("WHATSAPP_NUMBER", "+254708783067")
 CALLMEBOT_KEY = os.getenv("CALLMEBOT_KEY", "2531573")
 CALLMEBOT_API = "https://api.callmebot.com/whatsapp.php"
 
+
 def send_whatsapp_alert(message: str):
+    """Send a WhatsApp alert via CallMeBot"""
     try:
         params = {"phone": WHATSAPP_NUMBER, "text": message, "apikey": CALLMEBOT_KEY}
         requests.get(CALLMEBOT_API, params=params, timeout=10)
     except Exception as e:
         print("WhatsApp alert failed:", e)
 
-async def _refresh_cookies_async():
-    email = os.getenv("PROLIFIC_EMAIL")
+
+async def _refresh_cookies_once(headless: bool = True):
+    """Attempt a single login to refresh cookies"""
+    username = os.getenv("PROLIFIC_EMAIL")
     password = os.getenv("PROLIFIC_PASSWORD")
-    if not email or not password:
+    if not username or not password:
         send_whatsapp_alert("❌ Cookie refresh failed: missing PROLIFIC_EMAIL / PROLIFIC_PASSWORD.")
         raise RuntimeError("Missing Prolific credentials in env")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context()
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-infobars",
+                "--window-size=1280,800",
+            ],
+        )
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/141.0.0.0 Safari/537.36"
+        )
         page = await context.new_page()
-        await page.goto("https://app.prolific.com/login", timeout=60000)
-        await page.fill('input[name="email"]', email)
-        await page.fill('input[name="password"]', password)
+        await page.goto("https://auth.prolific.com/u/login", wait_until="domcontentloaded", timeout=60000)
+
+        # Wait for login fields
+        await page.wait_for_selector('input[id="username"]', timeout=60000)
+        await page.type('input[id="username"]', username, delay=50)
+        await page.type('input[id="password"]', password, delay=50)
         await page.click('button[type="submit"]')
-        await page.wait_for_url("**/studies", timeout=60000)
+
+        # Wait for redirect / OAuth
+        await page.wait_for_load_state("domcontentloaded")
+        await asyncio.sleep(5)
+
+        if "oauth/callback" in page.url or "404" in page.url or "auth.prolific.com" in page.url:
+            try:
+                await page.goto("https://app.prolific.com/studies", wait_until="domcontentloaded")
+            except:
+                pass
+
+        await asyncio.sleep(3)
         cookies = await context.cookies()
         await browser.close()
+
+        # Save cookies to .env
         cookie_header = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
         env_path = find_dotenv()
-        if not env_path:
-            raise RuntimeError(".env file not found for storing cookies")
-        set_key(env_path, "PROLIFIC_COOKIES", cookie_header)
+        if env_path:
+            set_key(env_path, "PROLIFIC_COOKIES", cookie_header)
         os.environ["PROLIFIC_COOKIES"] = cookie_header
-        send_whatsapp_alert("✅ Prolific cookies refreshed successfully.")
+
         return cookie_header
 
-def refresh_cookies():
-    return asyncio.run(_refresh_cookies_async())
+
+async def _refresh_cookies_with_retries(headless: bool = True, retries: int = 3):
+    """Retry cookie refresh up to `retries` times if it fails"""
+    attempt = 1
+    while attempt <= retries:
+        try:
+            cookie_header = await _refresh_cookies_once(headless=headless)
+            send_whatsapp_alert(f"✅ Prolific cookies refreshed successfully on attempt {attempt}.")
+            print(f"✅ Cookies refreshed on attempt {attempt}")
+            return cookie_header
+        except PlaywrightTimeoutError as e:
+            send_whatsapp_alert(f"⚠️ Attempt {attempt} failed: Timeout. Retrying...")
+            print(f"Attempt {attempt} failed: {e}")
+            attempt += 1
+            await asyncio.sleep(5)
+        except Exception as e:
+            send_whatsapp_alert(f"⚠️ Attempt {attempt} failed: {e}. Retrying...")
+            print(f"Attempt {attempt} failed: {e}")
+            attempt += 1
+            await asyncio.sleep(5)
+
+    send_whatsapp_alert("❌ Failed to refresh Prolific cookies after multiple attempts.")
+    raise RuntimeError("Failed to refresh cookies after retries.")
+
+
+def refresh_cookies(headless: bool = True):
+    """Wrapper to run async refresh with retries synchronously"""
+    return asyncio.run(_refresh_cookies_with_retries(headless=headless))
+
 
 def get_valid_cookies():
+    """Check if current cookies are valid; refresh if necessary"""
     cookies = os.getenv("PROLIFIC_COOKIES", "")
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Cookie": cookies}
     try:
@@ -54,7 +117,6 @@ def get_valid_cookies():
         if res.status_code == 200:
             return cookies
         else:
-            # Attempt refresh
             send_whatsapp_alert("⚠️ Prolific cookies invalid or expired. Attempting refresh...")
             new = refresh_cookies()
             return new
@@ -62,3 +124,4 @@ def get_valid_cookies():
         send_whatsapp_alert(f"⚠️ Cookie check failed: {e}. Attempting refresh...")
         new = refresh_cookies()
         return new
+
