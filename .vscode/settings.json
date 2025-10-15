@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": [
+        "./prolific_watcher/utils",
+        "./prolific_watcher"
+    ]
+}
